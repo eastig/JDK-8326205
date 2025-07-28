@@ -1,3 +1,4 @@
+#include "code/compiledIC.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
 #include "runtime/nmethodGrouper.hpp"
 #include "runtime/suspendedThreadTask.hpp"
@@ -183,6 +184,7 @@ class HotCodeHeapCandidates : public StackObj {
           tty->print_cr("\tRelocating nm: <%p> method: <%s> count: <%d> frequency: <%f>", nm, nm->method()->external_name(), count, frequency);
         }
 
+        CompiledICLocker ic_locker(nm);
         nm->relocate(CodeBlobType::MethodHot);
       }
       return true;
@@ -200,7 +202,9 @@ void NMethodGrouper::group_nmethods() {
   sampler.collect_samples();
 
   {
-    MutexLocker ml(CodeCache_lock, Mutex::_no_safepoint_check_flag);
+    MutexLocker ml_Compile_lock(Compile_lock);
+    MutexLocker ml_CompiledIC_lock(CompiledIC_lock, Mutex::_no_safepoint_check_flag);
+    MutexLocker ml_CodeCache_lock(CodeCache_lock, Mutex::_no_safepoint_check_flag);
     int total_samples = sampler.total_samples();
     int processed_threads = sampler.processed_threads();
     tty->print_cr("Profiling nmethods done: %d samples, %d nmethods, %d processed threads, %d unregistered nmethods",
