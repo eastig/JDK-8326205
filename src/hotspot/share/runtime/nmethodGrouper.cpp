@@ -14,7 +14,7 @@ class C2NMethodGrouperThread : public NonJavaThread {
 };
 
 NonJavaThread *NMethodGrouper::_nmethod_grouper_thread = nullptr;
-LinkedListImpl<const nmethod*> NMethodGrouper::_unregistered_nmethods;
+LinkedListImpl<nmethod* const> NMethodGrouper::_unregistered_nmethods;
 
 void NMethodGrouper::initialize() {
   _nmethod_grouper_thread = new C2NMethodGrouperThread();
@@ -95,7 +95,7 @@ static inline int min_samples() {
   return 3000; // Minimum number of samples to collect
 }
 
-using NMethodSamples = ResourceHashtable<const nmethod*, int, 1024>;
+using NMethodSamples = ResourceHashtable<nmethod* const, int, 1024>;
 
 class ThreadSampler : public StackObj {
  private:
@@ -154,13 +154,13 @@ class ThreadSampler : public StackObj {
     return _processed_threads;
   }
 
-  void exclude_unregistered_nmethods(const LinkedListImpl<const nmethod*>& unregistered);
+  void exclude_unregistered_nmethods(const LinkedListImpl<nmethod* const>& unregistered);
 };
 
-void ThreadSampler::exclude_unregistered_nmethods(const LinkedListImpl<const nmethod*>& unregistered) {
-  LinkedListIterator<const nmethod*> it(unregistered.head());
+void ThreadSampler::exclude_unregistered_nmethods(const LinkedListImpl<nmethod* const>& unregistered) {
+  LinkedListIterator<nmethod* const> it(unregistered.head());
   while (!it.is_empty()) {
-    const nmethod* nm = *it.next();
+    nmethod* const nm = *it.next();
     int* count = _samples.get(nm);
     if (count != nullptr) {
       _total_samples -= *count;
@@ -171,7 +171,23 @@ void ThreadSampler::exclude_unregistered_nmethods(const LinkedListImpl<const nme
 
 class HotCodeHeapCandidates : public StackObj {
  public:
-  void find(const NMethodSamples& samples) {
+  void find(const NMethodSamples& samples, int total_samples) {
+    auto func = [&](nmethod* const nm, int count) {
+      double frequency = (double) count / total_samples;
+      if (frequency < HotCodeMinMethodFrequency) {
+        return true;
+      }
+
+      if (CodeCache::get_code_blob_type(nm) != CodeBlobType::MethodHot) {
+        if (PrintCodeCache) {
+          tty->print_cr("\tRelocating nm: <%p> method: <%s> count: <%d> frequency: <%f>", nm, nm->method()->external_name(), count, frequency);
+        }
+
+        nm->relocate(CodeBlobType::MethodHot);
+      }
+      return true;
+    };
+    samples.iterate(func);
   }
 
   void relocate() {}
@@ -204,12 +220,12 @@ void NMethodGrouper::group_nmethods() {
     // TODO: We might want to update nmethods GC status to prevent them from getting cold.
 
     HotCodeHeapCandidates candidates;
-    candidates.find(sampler.samples());
+    candidates.find(sampler.samples(), sampler.total_samples());
     candidates.relocate();
   }
 }
 
-void NMethodGrouper::unregister_nmethod(const nmethod* nm) {
+void NMethodGrouper::unregister_nmethod(nmethod* const nm) {
   assert_locked_or_safepoint(CodeCache_lock);
   _unregistered_nmethods.add(nm);
   // TODO: add assert to check if add returns nullptr we have exceeded a certain threshold for unregistered nmethods.

@@ -14,12 +14,12 @@ class NMethodGrouper : public AllStatic {
   }
 
   static NonJavaThread *_nmethod_grouper_thread;
-  static LinkedListImpl<const nmethod*> _unregistered_nmethods;
+  static LinkedListImpl<nmethod* const> _unregistered_nmethods;
 
  public:
   static void group_nmethods_loop();
   static void initialize();
-  static void unregister_nmethod(const nmethod* nm);
+  static void unregister_nmethod(nmethod* const nm);
 };
 
 #endif // SHARE_RUNTIME_NMETHODGROUPER_HPP

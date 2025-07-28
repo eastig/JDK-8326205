@@ -1551,6 +1551,10 @@ const int ObjectAlignmentInBytes = 8;
           "Size of code heap with predicted hot methods (in bytes)")        \
           constraint(VMPageSizeConstraintFunc, AtParse)                     \
                                                                             \
+  product(double, HotCodeMinMethodFrequency, 0.0001,                        \
+          "Minimum frequency of a method to be considered actively used")   \
+          range(0.0, 1.0)                                                   \
+                                                                            \
   product_pd(uintx, CodeCacheExpansionSize,                                 \
           "Code cache expansion size (in bytes)")                           \
           range(32*K, SIZE_MAX)                                             \
