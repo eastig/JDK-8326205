@@ -1161,8 +1161,8 @@ nmethod* nmethod::new_nmethod(const methodHandle& method,
 #if INCLUDE_JVMCI
     + align_up(speculations_len                       , oopSize)
 #endif
-    + align_up(debug_info->data_size()                , oopSize)
-    + align_up(ImmutableDataReferencesCounterSize     , oopSize);
+    + align_up(debug_info->data_size()           , oopSize)
+    + align_up(ImmutableDataReferencesCounterSize, oopSize);
 
   // First, allocate space for immutable data in C heap.
   address immutable_data = nullptr;
@@ -1518,12 +1518,15 @@ nmethod::nmethod(const nmethod &nm) : CodeBlob(nm._name, nm._kind, nm._size, nm.
 }
 
 nmethod* nmethod::relocate(CodeBlobType code_blob_type) {
+  // Locks required to be held by caller to ensure the nmethod
+  // is not modified or purged from code cache during relocation
+  assert_lock_strong(CodeCache_lock);
+  assert_lock_strong(Compile_lock);
+  assert(CompiledICLocker::is_safe(this), "mt unsafe call");
+
   if (!is_relocatable()) {
     return nullptr;
   }
-
-  MutexLocker ml_Compile_lock(Compile_lock);
-  MutexLocker ml_CodeCache_lock(CodeCache_lock, Mutex::_no_safepoint_check_flag);
 
   run_nmethod_entry_barrier();
   nmethod* nm_copy = new (size(), code_blob_type) nmethod(*this);
@@ -1605,24 +1608,6 @@ nmethod* nmethod::relocate(CodeBlobType code_blob_type) {
 }
 
 bool nmethod::is_relocatable() {
-#if INCLUDE_JVMCI
-  if (jvmci_nmethod_data() != nullptr && jvmci_nmethod_data()->has_mirror()) {
-    return false;
-  }
-#endif
-
-  if (is_marked_for_deoptimization()) {
-    return false;
-  }
-
-  if (is_unloading()) {
-    return false;
-  }
-
-  if (is_osr_method()) {
-    return false;
-  }
-
   if (!is_java_method()) {
     return false;
   }
@@ -1631,11 +1616,26 @@ bool nmethod::is_relocatable() {
     return false;
   }
 
-  {
-    CompiledICLocker ic_locker(this);
-    if (has_evol_metadata()) {
-      return false;
-    }
+  if (is_osr_method()) {
+    return false;
+  }
+
+  if (is_marked_for_deoptimization()) {
+    return false;
+  }
+
+#if INCLUDE_JVMCI
+  if (jvmci_nmethod_data() != nullptr && jvmci_nmethod_data()->has_mirror()) {
+    return false;
+  }
+#endif
+
+  if (is_unloading()) {
+    return false;
+  }
+
+  if (has_evol_metadata()) {
+    return false;
   }
 
   return true;
@@ -2446,11 +2446,14 @@ void nmethod::purge(bool unregister_nmethod) {
   delete[] _compiled_ic_data;
 
   if (_immutable_data != blob_end()) {
+    int reference_count = get_immutable_data_references_counter();
+    assert(reference_count > 0, "immutable data has no references");
+
+    set_immutable_data_references_counter(reference_count - 1);
+
     // Free memory if this is the last nmethod referencing immutable data
-    if (get_immutable_data_references_counter() == 1) {
+    if (reference_count == 0) {
       os::free(_immutable_data);
-    } else {
-      set_immutable_data_references_counter(get_immutable_data_references_counter() - 1);
     }
 
     _immutable_data = blob_end(); // Valid not null address
