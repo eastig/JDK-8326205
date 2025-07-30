@@ -24,8 +24,8 @@ class C2NMethodGrouperThread : public NonJavaThread {
   const char* type_name() const override { return "C2NMethodGrouperThread"; }
 };
 
-using UnregisteredNMethods = LinkedListImpl<const nmethod*>;
-using UnregisteredNMethodsIterator = LinkedListIterator<const nmethod*>;
+using UnregisteredNMethods = LinkedListImpl<nmethod*>;
+using UnregisteredNMethodsIterator = LinkedListIterator<nmethod*>;
 
 NonJavaThread *NMethodGrouper::_nmethod_grouper_thread = nullptr;
 UnregisteredNMethods NMethodGrouper::_unregistered_nmethods;
@@ -138,7 +138,7 @@ static inline int min_samples() {
   return 3000; // Minimum number of samples to collect
 }
 
-using NMethodSamples = ResourceHashtable<const nmethod*, int, 1024>;
+using NMethodSamples = ResourceHashtable<nmethod*, int, 1024>;
 
 class ThreadSampler : public StackObj {
  private:
@@ -203,7 +203,7 @@ class ThreadSampler : public StackObj {
 void ThreadSampler::exclude_unregistered_nmethods(const UnregisteredNMethods& unregistered) {
   UnregisteredNMethodsIterator it(unregistered.head());
   while (!it.is_empty()) {
-    const nmethod* nm = *it.next();
+    nmethod* nm = *it.next();
     int* count = _samples.get(nm);
     if (count != nullptr) {
       _total_samples -= *count;
@@ -215,7 +215,7 @@ void ThreadSampler::exclude_unregistered_nmethods(const UnregisteredNMethods& un
 class HotCodeHeapCandidates : public StackObj {
  public:
   void find(const NMethodSamples& samples, int total_samples) {
-    auto func = [&](nmethod* const nm, int count) {
+    auto func = [&](nmethod* nm, int count) {
       double frequency = (double) count / total_samples;
       if (frequency < HotCodeMinMethodFrequency) {
         return true;
@@ -279,7 +279,7 @@ static bool percent_exceeds(size_t value, size_t total, size_t percent) {
   return (value * 100) > percent * total;
 }
 
-void NMethodGrouper::unregister_nmethod(const nmethod* nm) {
+void NMethodGrouper::unregister_nmethod(nmethod* nm) {
   assert_locked_or_safepoint(CodeCache_lock);
   if (!nm->is_compiled_by_c2()) {
     return; // Only C2 nmethods are tracked for grouping
@@ -299,7 +299,7 @@ void NMethodGrouper::unregister_nmethod(const nmethod* nm) {
   }
 }
 
-void NMethodGrouper::register_nmethod(const nmethod* nm) {
+void NMethodGrouper::register_nmethod(nmethod* nm) {
   assert_locked_or_safepoint(CodeCache_lock);
   if (!nm->is_compiled_by_c2()) {
     return; // Only C2 nmethods are registered for grouping
