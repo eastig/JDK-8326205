@@ -130,6 +130,8 @@ Mutex*   AOTCodeCStrings_lock         = nullptr;
 
 Monitor* ContinuationRelativize_lock  = nullptr;
 
+Monitor* NMethodGrouper_lock          = nullptr;
+
 Mutex*   Metaspace_lock               = nullptr;
 Monitor* MetaspaceCritical_lock       = nullptr;
 Mutex*   ClassLoaderDataGraph_lock    = nullptr;
@@ -360,6 +362,8 @@ void mutex_init() {
 #endif
   MUTEX_DEFL(JvmtiThreadState_lock          , PaddedMutex  , JvmtiVTMSTransition_lock);   // Used by JvmtiThreadState/JvmtiEventController
   MUTEX_DEFL(SharedDecoder_lock             , PaddedMutex  , NmtVirtualMemory_lock); // Must be lower than NmtVirtualMemory_lock due to MemTracker::print_containing_region
+
+  MUTEX_DEFN(NMethodGrouper_lock            , PaddedMonitor, nosafepoint);
 
   // Allocate RecursiveMutex
   MultiArray_lock = new RecursiveMutex();

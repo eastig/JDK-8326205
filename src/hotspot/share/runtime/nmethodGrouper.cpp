@@ -1,9 +1,19 @@
 #include "code/compiledIC.hpp"
+#include "memory/universe.hpp"
+#include "runtime/atomic.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
 #include "runtime/nmethodGrouper.hpp"
 #include "runtime/suspendedThreadTask.hpp"
+#include "runtime/os.hpp"
 #include "runtime/threads.hpp"
+#include "utilities/globalDefinitions.hpp"
 #include "utilities/resourceHash.hpp"
+
+enum class ProfilingState {
+  NotStarted,
+  Running,
+  Waiting
+};
 
 class C2NMethodGrouperThread : public NonJavaThread {
  public:
@@ -14,8 +24,25 @@ class C2NMethodGrouperThread : public NonJavaThread {
   const char* type_name() const override { return "C2NMethodGrouperThread"; }
 };
 
+using UnregisteredNMethods = LinkedListImpl<const nmethod*>;
+using UnregisteredNMethodsIterator = LinkedListIterator<const nmethod*>;
+
 NonJavaThread *NMethodGrouper::_nmethod_grouper_thread = nullptr;
-LinkedListImpl<nmethod* const> NMethodGrouper::_unregistered_nmethods;
+UnregisteredNMethods NMethodGrouper::_unregistered_nmethods;
+
+static volatile int _profiling_state = static_cast<int>(ProfilingState::NotStarted);
+
+static volatile size_t _unregistered_c2_nmethods_count = 0;
+static volatile size_t _new_c2_nmethods_count = 0;
+static volatile size_t _total_c2_nmethods_count = 0;
+
+static ProfilingState get_profiling_state() {
+  return static_cast<ProfilingState>(Atomic::load_acquire(&_profiling_state));
+}
+
+static void set_profiling_state(ProfilingState new_state) {
+  Atomic::release_store(&_profiling_state, static_cast<int>(new_state));
+}
 
 void NMethodGrouper::initialize() {
   _nmethod_grouper_thread = new C2NMethodGrouperThread();
@@ -26,11 +53,35 @@ void NMethodGrouper::initialize() {
   }
 }
 
-void NMethodGrouper::group_nmethods_loop() {
+static void wait_while_cpu_idle() {
+  constexpr int sleep_duration_sec = 50; // Sleep for 50 seconds
   while (true) {
-    // TODO: implement logic to group nmethods if they are sparse.
-    os::naked_sleep(60 * 1000);
+    double cpu_time1 = os::elapsed_process_cpu_time();
+    os::naked_sleep(sleep_duration_sec * 1000); // Sleep for 50 seconds in milliseconds
+    double cpu_time2 = os::elapsed_process_cpu_time();
+    // Check if the CPU was active during the sleep period
+    if ((cpu_time2 - cpu_time1) / sleep_duration_sec >= 1.0) {
+      break;
+    }
+  }
+}
+
+void NMethodGrouper::group_nmethods_loop() {
+  {
+    MonitorLocker ml(NMethodGrouper_lock, Mutex::_no_safepoint_check_flag);
+    ml.wait(0); // Wait without timeout until notified
+  }
+
+  while (true) {
+    set_profiling_state(ProfilingState::Waiting);
+    wait_while_cpu_idle();
+    set_profiling_state(ProfilingState::Running);
     group_nmethods();
+    {
+      set_profiling_state(ProfilingState::Waiting);
+      MonitorLocker ml(NMethodGrouper_lock, Mutex::_no_safepoint_check_flag);
+      ml.wait(0); // Wait without timeout until notified
+    }
   }
 }
 
@@ -51,16 +102,7 @@ class GetC2NMethodTask : public SuspendedThreadTask {
       return;
     }
 
-    intptr_t *last_sp = jt->last_Java_sp();
-    address pc = nullptr;
-    if (last_sp == nullptr) {
-      pc = os::fetch_frame_from_context(context.ucontext(), nullptr, &last_sp);
-    } else {
-      pc = jt->last_Java_pc();
-      if (pc == nullptr) {
-        pc = frame::return_address(last_sp);
-      }
-    }
+    address pc = os::fetch_frame_from_context(context.ucontext(), nullptr, nullptr);
 
     if (pc != nullptr && !Interpreter::contains(pc) && CodeCache::contains(pc)) {
       const CodeBlob* const cb = CodeCache::find_blob_fast(pc);
@@ -96,7 +138,7 @@ static inline int min_samples() {
   return 3000; // Minimum number of samples to collect
 }
 
-using NMethodSamples = ResourceHashtable<nmethod* const, int, 1024>;
+using NMethodSamples = ResourceHashtable<const nmethod*, int, 1024>;
 
 class ThreadSampler : public StackObj {
  private:
@@ -155,13 +197,13 @@ class ThreadSampler : public StackObj {
     return _processed_threads;
   }
 
-  void exclude_unregistered_nmethods(const LinkedListImpl<nmethod* const>& unregistered);
+  void exclude_unregistered_nmethods(const UnregisteredNMethods& unregistered);
 };
 
-void ThreadSampler::exclude_unregistered_nmethods(const LinkedListImpl<nmethod* const>& unregistered) {
-  LinkedListIterator<nmethod* const> it(unregistered.head());
+void ThreadSampler::exclude_unregistered_nmethods(const UnregisteredNMethods& unregistered) {
+  UnregisteredNMethodsIterator it(unregistered.head());
   while (!it.is_empty()) {
-    nmethod* const nm = *it.next();
+    const nmethod* nm = *it.next();
     int* count = _samples.get(nm);
     if (count != nullptr) {
       _total_samples -= *count;
@@ -229,10 +271,57 @@ void NMethodGrouper::group_nmethods() {
   }
 }
 
-void NMethodGrouper::unregister_nmethod(nmethod* const nm) {
+static size_t get_c2_code_size() {
+  return 32 * M; // Placeholder for actual C2 code size calculation
+}
+
+static bool percent_exceeds(size_t value, size_t total, size_t percent) {
+  return (value * 100) > percent * total;
+}
+
+void NMethodGrouper::unregister_nmethod(const nmethod* nm) {
   assert_locked_or_safepoint(CodeCache_lock);
+  if (!nm->is_compiled_by_c2()) {
+    return; // Only C2 nmethods are tracked for grouping
+  }
+
+  // We want the value be available before we release CodeCache_lock.
+  Atomic::dec(&_total_c2_nmethods_count, memory_order_relaxed);
+
+  _unregistered_c2_nmethods_count++;
   _unregistered_nmethods.add(nm);
-  // TODO: add assert to check if add returns nullptr we have exceeded a certain threshold for unregistered nmethods.
-  // Instead of a linked list, we can consider using a fixed-size array. When the array is full, it will be a sign
-  // of unstable CodeCache. We will stop adding unregistered nmethods.
+  if (get_profiling_state() == ProfilingState::Waiting &&
+      percent_exceeds(_unregistered_c2_nmethods_count, _total_c2_nmethods_count + _unregistered_c2_nmethods_count, 10)) {
+    _unregistered_c2_nmethods_count = 0;
+    _unregistered_nmethods.clear();
+    MonitorLocker ml(NMethodGrouper_lock, Mutex::_no_safepoint_check_flag);
+    ml.notify();
+  }
+}
+
+void NMethodGrouper::register_nmethod(const nmethod* nm) {
+  assert_locked_or_safepoint(CodeCache_lock);
+  if (!nm->is_compiled_by_c2()) {
+    return; // Only C2 nmethods are registered for grouping
+  }
+
+  // We want the value be available before we release CodeCache_lock.
+  Atomic::inc(&_total_c2_nmethods_count, memory_order_relaxed);
+
+  if (get_profiling_state() == ProfilingState::NotStarted &&
+      get_c2_code_size() >= 32 * M) {
+    MonitorLocker ml(NMethodGrouper_lock, Mutex::_no_safepoint_check_flag);
+    ml.notify();
+    return;
+  }
+
+  // CodeCache_lock is held, so we can safely increment the count.
+  _new_c2_nmethods_count++;
+
+  if (get_profiling_state() == ProfilingState::Waiting &&
+      percent_exceeds(_new_c2_nmethods_count, _total_c2_nmethods_count, 5)) {
+    _new_c2_nmethods_count = 0;
+    MonitorLocker ml(NMethodGrouper_lock, Mutex::_no_safepoint_check_flag);
+    ml.notify();
+  }
 }
