@@ -15,6 +15,7 @@ class NMethodGrouper : public AllStatic {
 
   static NonJavaThread *_nmethod_grouper_thread;
   static LinkedListImpl<nmethod*> _unregistered_nmethods;
+  static bool _is_initialized;
 
  public:
   static void group_nmethods_loop();

@@ -1268,6 +1268,7 @@ void nmethod::post_init() {
   finalize_relocations();
 
   Universe::heap()->register_nmethod(this);
+  NMethodGrouper::register_nmethod(this);
   DEBUG_ONLY(Universe::heap()->verify_nmethod(this));
 
   CodeCache::commit(this);
