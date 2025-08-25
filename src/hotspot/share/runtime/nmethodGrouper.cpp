@@ -26,11 +26,9 @@ class C2NMethodGrouperThread : public NonJavaThread {
   const char* type_name() const override { return "C2NMethodGrouperThread"; }
 };
 
-using UnregisteredNMethods = LinkedListImpl<nmethod*>;
-using UnregisteredNMethodsIterator = LinkedListIterator<nmethod*>;
-
 NonJavaThread *NMethodGrouper::_nmethod_grouper_thread = nullptr;
-UnregisteredNMethods NMethodGrouper::_unregistered_nmethods;
+NMethodList NMethodGrouper::_unregistered_nmethods;
+NMethodMap NMethodGrouper::_hot_nmethods(1, 10240);
 bool NMethodGrouper::_is_initialized = false;
 
 static volatile int _profiling_state = static_cast<int>(ProfilingState::NotStarted);
@@ -210,11 +208,11 @@ class ThreadSampler : public StackObj {
     return _processed_threads;
   }
 
-  void exclude_unregistered_nmethods(const UnregisteredNMethods& unregistered);
+  void exclude_unregistered_nmethods(const NMethodList& unregistered);
 };
 
-void ThreadSampler::exclude_unregistered_nmethods(const UnregisteredNMethods& unregistered) {
-  UnregisteredNMethodsIterator it(unregistered.head());
+void ThreadSampler::exclude_unregistered_nmethods(const NMethodList& unregistered) {
+  NMethodListIterator it(unregistered.head());
   while (!it.is_empty()) {
     nmethod* nm = *it.next();
     int* count = _samples.get(nm);
@@ -226,28 +224,75 @@ void ThreadSampler::exclude_unregistered_nmethods(const UnregisteredNMethods& un
 }
 
 class HotCodeHeapCandidates : public StackObj {
+ private:
+  NMethodList _hot_candidates;
+  NMethodList _cold_nmethods;
+
  public:
-  void find(const NMethodSamples& samples, int total_samples) {
+  void find_hot(const NMethodSamples& samples, int total_samples) {
     auto func = [&](nmethod* nm, int count) {
+      if (NMethodGrouper::_hot_nmethods.contains(nm)) {
+        NMethodGrouper::_hot_nmethods.put(nm, 0); // Reset last seen counter
+        return;
+      }
+
       double frequency = (double) count / total_samples;
       if (frequency < HotCodeMinMethodFrequency) {
-        return true;
+        return;
       }
 
       if (CodeCache::get_code_blob_type(nm) != CodeBlobType::MethodHot) {
         if (PrintCodeCache) {
-          tty->print_cr("[NMethodGrouper]: \tRelocating nm: <%p> method: <%s> count: <%d> frequency: <%f>", nm, nm->method()->external_name(), count, frequency);
+          tty->print_cr("[NMethodGrouper]: \tFound candidate nm: <%p> method: <%s> count: <%d> frequency: <%f>", nm, nm->method()->external_name(), count, frequency);
         }
-
-        CompiledICLocker ic_locker(nm);
-        nm->relocate(CodeBlobType::MethodHot);
+        _hot_candidates.add(nm);
       }
-      return true;
     };
-    samples.iterate(func);
+    samples.iterate_all(func);
   }
 
-  void relocate() {}
+  void find_cold() {
+    auto func = [&](nmethod* nm, int count) {
+      if (count >= NMethodGrouper::maxNotSeenInProfiles) {
+        _cold_nmethods.add(nm);
+      }
+
+      NMethodGrouper::_hot_nmethods.put(nm, count + 1);
+    };
+    NMethodGrouper::_hot_nmethods.iterate_all(func);
+  }
+
+  void remove_cold() {
+    NMethodListIterator it(_cold_nmethods.head());
+    while (!it.is_empty()) {
+      nmethod* nm = *it.next();
+
+      if (PrintCodeCache) {
+        tty->print_cr("[NMethodGrouper]: \tRemoving cold nm: <%p> method: <%s>", nm, nm->method()->external_name());
+      }
+
+      CompiledICLocker ic_locker(nm);
+      if (nm->relocate(CodeBlobType::MethodNonProfiled) != nullptr) {
+        NMethodGrouper::_hot_nmethods.remove(nm);
+      }
+    }
+  }
+
+  void relocate_hot() {
+    NMethodListIterator it(_hot_candidates.head());
+    while (!it.is_empty()) {
+      nmethod* nm = *it.next();
+
+      if (PrintCodeCache) {
+        tty->print_cr("[NMethodGrouper]: \tRelocating nm: <%p> method: <%s>", nm, nm->method()->external_name());
+      }
+
+      CompiledICLocker ic_locker(nm);
+      if (nm->relocate(CodeBlobType::MethodHot) != nullptr) {
+        NMethodGrouper::_hot_nmethods.put(nm, 0);
+      }
+    }
+  }
 };
 
 void NMethodGrouper::group_nmethods() {
@@ -279,8 +324,10 @@ void NMethodGrouper::group_nmethods() {
     // TODO: We might want to update nmethods GC status to prevent them from getting cold.
 
     HotCodeHeapCandidates candidates;
-    candidates.find(sampler.samples(), sampler.total_samples());
-    candidates.relocate();
+    candidates.find_hot(sampler.samples(), sampler.total_samples());
+    candidates.find_cold();
+    candidates.remove_cold();
+    candidates.relocate_hot();
   }
 }
 
@@ -310,6 +357,10 @@ void NMethodGrouper::unregister_nmethod(nmethod* nm) {
 
   if (!nm->is_compiled_by_c2()) {
     return; // Only C2 nmethods are tracked for grouping
+  }
+
+  if (NMethodGrouper::_hot_nmethods.contains(nm)) {
+    NMethodGrouper::_hot_nmethods.remove(nm); // nmethod is no longer in hot code heap
   }
 
   // We want the value be available before we release CodeCache_lock.

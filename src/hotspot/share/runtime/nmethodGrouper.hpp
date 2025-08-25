@@ -5,6 +5,10 @@
 #include "utilities/linkedlist.hpp"
 #include "runtime/nonJavaThread.hpp"
 
+using NMethodList = LinkedListImpl<nmethod*>;
+using NMethodListIterator = LinkedListIterator<nmethod*>;
+using NMethodMap = ResizeableResourceHashtable<nmethod*, int64_t, AnyObj::C_HEAP, mtCode>;
+
 class NMethodGrouper : public AllStatic {
  private:
   static void group_nmethods();
@@ -14,7 +18,7 @@ class NMethodGrouper : public AllStatic {
   }
 
   static NonJavaThread *_nmethod_grouper_thread;
-  static LinkedListImpl<nmethod*> _unregistered_nmethods;
+  static NMethodList _unregistered_nmethods;
   static bool _is_initialized;
 
  public:
@@ -22,6 +26,9 @@ class NMethodGrouper : public AllStatic {
   static void initialize();
   static void unregister_nmethod(nmethod* nm);
   static void register_nmethod(nmethod* nm);
+
+  static const int64_t maxNotSeenInProfiles = 8;
+  static NMethodMap _hot_nmethods;
 };
 
 #endif // SHARE_RUNTIME_NMETHODGROUPER_HPP
